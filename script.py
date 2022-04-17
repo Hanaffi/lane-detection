@@ -150,6 +150,79 @@ class Line:
         cur_right_fit = np.average(self.recent_right_fit[-3:], axis=0)
         return cur_left_fit, cur_right_fit
 
+    # calculate the offset based on the lines
+    # Attempt to confirm that the center of the lanes is in the center of the image.
+    def find_offset(self):
+        left_fit, right_fit = self.average_fit()
+        base = 719  # given in lesson
+        middle = 1279 / 2  # middle of the image
+        xm_per_pix = 3.7 / 650  # meters per pixel in x dimension, given in the lesson
+        left_base = left_fit[0] * base**2 + left_fit[1] * base + left_fit[2]
+        right_base = right_fit[0] * base**2 + right_fit[1] * base + right_fit[2]
+        offset = ((right_base - left_base) - middle) * xm_per_pix
+        return offset
+
+    # return curvature based on method given in lesson.
+    def find_curvature(self):
+        left_fit, right_fit = self.average_fit()
+
+        # Generate some fake data to represent lane-line pixels
+        ploty = np.linspace(0, 719, num=720)  # cover same range as the image
+
+        # arbitrary quadratic coefficient
+        l_quadratic_coeff = left_fit[0]
+        r_quadratic_coeff = right_fit[0]
+
+        # For each y position generate random x position within +/-50 pix
+        # of the line base position in each case (x=200 for left, and x=900 for right)
+        leftx = np.array(
+            [
+                200 + (y**2) * l_quadratic_coeff + np.random.randint(-50, high=51)
+                for y in ploty
+            ]
+        )
+        rightx = np.array(
+            [
+                900 + (y**2) * r_quadratic_coeff + np.random.randint(-50, high=51)
+                for y in ploty
+            ]
+        )
+
+        leftx = leftx[::-1]  # Reverse to match top-to-bottom in y
+        rightx = rightx[::-1]  # Reverse to match top-to-bottom in y
+
+        # Fit a second order polynomial to pixel positions in each fake lane line
+
+        # fit to the left line
+        left_fit = np.polyfit(ploty, leftx, 2)
+
+        # fit to the right line
+        right_fit = np.polyfit(ploty, rightx, 2)
+
+        # Define y value where we want radius of curvature
+        # in this case we'll use the max y value for the bottom of the image.
+        y_eval = np.max(ploty)
+
+        # Define conversions in x and y from pixels space to meters
+        ym_per_pix = 30 / 720  # meters per pixel in y dimension
+        xm_per_pix = 3.7 / 650  # meters per pixel in x dimension
+
+        # Fit new polynomials to x,y in world space
+        left_fit_cr = np.polyfit(ploty * ym_per_pix, leftx * xm_per_pix, 2)
+        right_fit_cr = np.polyfit(ploty * ym_per_pix, rightx * xm_per_pix, 2)
+
+        # Calculate the new radii of curvature (in meters)
+        left_curverad = (
+            (1 + (2 * left_fit_cr[0] * y_eval * ym_per_pix + left_fit_cr[1]) ** 2)
+            ** 1.5
+        ) / np.absolute(2 * left_fit_cr[0])
+        right_curverad = (
+            (1 + (2 * right_fit_cr[0] * y_eval * ym_per_pix + right_fit_cr[1]) ** 2)
+            ** 1.5
+        ) / np.absolute(2 * right_fit_cr[0])
+
+        return left_curverad, right_curverad
+
     def find_lane(self, warped):
         if not self.detected:
             # do our bad search if we've never seen the lines before
