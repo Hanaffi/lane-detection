@@ -1,8 +1,11 @@
+import sys
 import glob
 from math import floor
 
 import numpy as np
 import cv2
+
+from moviepy.editor import VideoFileClip
 
 # prepare object points, like (0,0,0), (1,0,0), (2,0,0) ....,(6,5,0)
 nx = 9
@@ -558,3 +561,233 @@ class Line:
         self.current_right_fit = np.polyfit(righty, rightx, 2)
 
         return True
+
+
+def draw_lane(undist, warped, stack, left_fit, right_fit):
+    ploty = np.linspace(0, 719, num=720)  # to cover same y-range as image
+    warped_mask = warped.copy()
+    left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
+    right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
+
+    # Create an image to draw the lines on
+    warp_zero = np.zeros_like(stack[:, :, 0]).astype(np.uint8)
+    color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+
+    # Recast the x and y points into usable format for cv2.fillPoly()
+    pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
+    pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
+    pts = np.hstack((pts_left, pts_right))
+
+    # Draw the lane onto the warped blank image
+    cv2.fillPoly(color_warp, np.int_([pts]), (0, 0, 255))
+    cv2.polylines(stack, np.int_([pts]), True, (255, 255, 255), 5)
+
+    # Warp the blank back to original image space using inverse perspective matrix (Minv)
+    newwarp = warper(color_warp, reverse=True)
+
+    # Combine the result with the original image
+    warped_mask = cv2.addWeighted(warped_mask, 1, color_warp, 0.3, 0)
+    result = cv2.addWeighted(undist, 1, newwarp, 0.3, 0)
+    return result, warped_mask
+
+
+# find white lane lines
+def find_white_lanes(img):
+    img = np.copy(img)
+    # convert to HSV color space
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    # 3 different threshold for different lighting condition
+
+    # high light , color = B, used in normal light condition
+    lower_1 = np.array([0, 0, 200])
+    upper_1 = np.array([255, 25, 255])
+
+    # high light , color = G, not used, saved for future experiment
+    lower_2 = np.array([0, 0, 200])
+    upper_2 = np.array([255, 25, 255])
+
+    # low h low s low v , color = R, used in low light condition
+    lower_3 = np.array([0, 0, 170])
+    upper_3 = np.array([255, 20, 190])
+
+    white_1 = cv2.inRange(hsv, lower_1, upper_1)
+    white_2 = cv2.inRange(hsv, lower_2, upper_2)
+    white_3 = cv2.inRange(hsv, lower_3, upper_3)
+
+    if len(white_1.nonzero()[0]) > 4000:
+        white_3 = np.zeros_like(white_1)
+
+    if len(white_2.nonzero()[0]) > 40000:  # too much false detection
+        white_2 = np.zeros_like(white_1)
+
+    if len(white_3.nonzero()[0]) > 40000:  # too much false detection
+        white_3 = np.zeros_like(white_1)
+
+    return white_1, white_2, white_3
+
+
+# find yellow lane lines
+def find_yellow_lanes(img):
+    img = np.copy(img)
+    # convert to HSV color space
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float)
+
+    # color = B, high s high v, used in normal light condition
+    lower_1 = np.array([0, 100, 100])
+    upper_1 = np.array([50, 255, 255])
+
+    # color = G, low s low v, used in low light condition
+    lower_2 = np.array([10, 35, 100])
+    upper_2 = np.array([40, 80, 180])
+
+    # color = R, low s high v, used in extreme high light condition
+    lower_3 = np.array([15, 30, 150])
+    upper_3 = np.array([45, 80, 255])
+
+    yellow_1 = cv2.inRange(hsv, lower_1, upper_1)
+    yellow_2 = cv2.inRange(hsv, lower_2, upper_2)
+    yellow_3 = cv2.inRange(hsv, lower_3, upper_3)
+
+    if len(yellow_1.nonzero()[0]) > 30000:
+        yellow_2 = np.zeros_like(yellow_1)
+        yellow_3 = np.zeros_like(yellow_1)
+
+    if len(yellow_2.nonzero()[0]) > 30000:
+        yellow_2 = np.zeros_like(yellow_1)
+
+    if len(yellow_3.nonzero()[0]) > 30000:
+        yellow_3 = np.zeros_like(yellow_1)
+
+    return yellow_1, yellow_2, yellow_3
+
+
+# full pipeline function
+def final_pipeline(img):
+    global tracker
+    global frame_id
+    frame_id = frame_id + 1
+
+    # image is input in RGB format from moviepy
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    # undistort the image
+    undist = distortion_correction(img, mtx, dist)
+
+    # warp to bird view
+    warped = warper(undist, reverse=False)
+
+    # find yellow and white lane line
+    # and map to binary image
+    yellow_1, yellow_2, yellow_3 = find_yellow_lanes(warped)
+    white_1, white_2, white_3 = find_white_lanes(warped)
+
+    w = np.zeros_like(white_1)
+    w[(white_1 > 0) | (white_2 > 0) | (white_3 > 0)] = 255
+
+    y = np.zeros_like(yellow_1)
+    y[(yellow_1 > 0) | (yellow_2 > 0) | (yellow_3 > 0)] = 255
+
+    # stack yellow and white lane line into one image
+    stack = np.zeros_like(img)
+    stack[:, :, 0] = y
+    stack[:, :, 1] = w
+
+    # find lane lines
+    tracker.find_lane(stack)
+
+    # get best fitting coefficents
+    left_fit, right_fit = tracker.average_fit()
+
+    # draw the road mask
+    undist = cv2.cvtColor(undist, cv2.COLOR_BGR2RGB)
+    result, warped_mask = draw_lane(undist, warped, stack, left_fit, right_fit)
+
+    warped = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+
+    # get statistics
+    left_curverad, right_curverad = tracker.find_curvature()
+    offset = tracker.find_offset()
+
+    # round our numbers for the display purposes
+    left_curverad = round(left_curverad, 2)
+    right_curverad = round(right_curverad, 2)
+    offset = round(float(offset), 2)
+
+    # text font and color in video
+    text_font = cv2.FONT_HERSHEY_SIMPLEX
+    text_color = (255, 255, 255)  # white for overwriting video
+
+    text_panel = np.zeros((240, 640, 3), dtype=np.uint8)
+
+    # frame id
+    cv2.putText(
+        text_panel,
+        "Frame id:     " + str(frame_id),
+        (30, 40),
+        text_font,
+        1,
+        text_color,
+        2,
+    )
+
+    # left curve radius
+    cv2.putText(
+        text_panel,
+        "Left Curve Radius: " + str(left_curverad) + "m",
+        (30, 80),
+        text_font,
+        1,
+        text_color,
+        2,
+    )
+
+    # right curve radius
+    cv2.putText(
+        text_panel,
+        "Right Curve Radius: " + str(right_curverad) + "m",
+        (30, 120),
+        text_font,
+        1,
+        text_color,
+        2,
+    )
+
+    # middle panel radius
+    cv2.putText(
+        text_panel,
+        "Center Offset:" + str(offset) + "m",
+        (30, 160),
+        text_font,
+        1,
+        text_color,
+        2,
+    )
+
+    diagScreen = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    warped = cv2.resize(warped, (320, 240), interpolation=cv2.INTER_AREA)
+    warped_plot = cv2.resize(stack, (320, 240), interpolation=cv2.INTER_AREA)
+    warped_mask = cv2.resize(warped_mask, (640, 480), interpolation=cv2.INTER_AREA)
+
+    # render original video with lane segment drawn in
+    diagScreen[0:720, 0:1280] = result
+    diagScreen[0:480, 1280:1920] = warped_mask
+    diagScreen[480:720, 1600:1920] = warped_plot
+    diagScreen[480:720, 1280:1600] = warped
+    diagScreen[720:960, 1280:1920] = text_panel
+
+    return diagScreen
+
+
+if __name__ == "__main__":
+    # frame id
+    tracker = Line()
+    frame_id = 0
+
+    # read in the project video
+    input_video_filename = sys.argv[1]
+    output_video_filename = sys.argv[2]
+
+    clip = VideoFileClip(input_video_filename)
+    clip = clip.fl_image(final_pipeline)
+    clip.write_videofile(output_video_filename, audio=False)
